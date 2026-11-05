@@ -19,6 +19,8 @@ final class PiPController: NSObject {
     private var sourceSize: CGSize
     /// Source window frame in global display coordinates (top-left origin), refreshed every second.
     private var sourceBounds: CGRect
+    /// Where the window's content sits in the latest captured frame.
+    private var frameGeometry: FrameGeometry?
     private var askedForEventAccess = false
     private var watchTimer: Timer?
     private var activationObserver: NSObjectProtocol?
@@ -49,8 +51,12 @@ final class PiPController: NSObject {
         view.onOpacityStep = { [weak self] step in self?.stepOpacity(step) }
         view.onFrameCommitted = { [weak self] in self?.saveFrame() }
         view.onScroll = { [weak self] event, point in self?.forwardScroll(event, at: point) }
+        view.onMouse = { [weak self] event, point in self?.forwardMouse(event, at: point) }
 
-        output.onFrame = { [weak self] surface in self?.view.display(surface) }
+        output.onFrame = { [weak self] surface, geometry in
+            self?.view.display(surface)
+            if let geometry { self?.frameGeometry = geometry }
+        }
         output.onStop = { [weak self] in self?.close() }
     }
 
@@ -161,7 +167,7 @@ final class PiPController: NSObject {
         }
         guard let scroll = event.cgEvent?.copy(), let setWindowLocation = Self.setWindowLocation else { return }
 
-        let local = CGPoint(x: point.x * sourceBounds.width, y: point.y * sourceBounds.height)
+        let local = windowLocal(point)
         scroll.location = CGPoint(x: sourceBounds.minX + local.x, y: sourceBounds.minY + local.y)
         // Vertical only: a sideways swipe means back/forward in browsers.
         scroll.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: 0)
@@ -173,6 +179,52 @@ final class PiPController: NSObject {
         scroll.setIntegerValueField(Self.windowNumberField, value: Int64(windowID))
         setWindowLocation(scroll, local)
         scroll.postToPid(pid)
+    }
+
+    /// Re-targets a click/drag at the matching spot in the source window, posted straight to
+    /// the source app like the scroll events, so the app underneath keeps focus.
+    private func forwardMouse(_ event: NSEvent, at point: CGPoint) {
+        guard CGPreflightPostEventAccess() else {
+            if !askedForEventAccess {
+                askedForEventAccess = true
+                CGRequestPostEventAccess()
+            }
+            return
+        }
+        guard let mouse = event.cgEvent?.copy(), let setWindowLocation = Self.setWindowLocation else { return }
+
+        let isButtonDown = event.type == .leftMouseDown || event.type == .rightMouseDown
+        // On a press, use the window's current frame: the cached one can lag behind a move.
+        if isButtonDown, let live = WindowCatalog.info(for: windowID)?.bounds { sourceBounds = live }
+        let local = windowLocal(point)
+        let global = CGPoint(x: sourceBounds.minX + local.x, y: sourceBounds.minY + local.y)
+
+        func prepare(_ e: CGEvent) {
+            e.location = global
+            e.setIntegerValueField(Self.windowNumberField, value: Int64(windowID))
+            setWindowLocation(e, local)
+        }
+
+        // Apps (web views especially) need a hover before they accept a click.
+        if isButtonDown,
+           let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: global, mouseButton: .left) {
+            prepare(move)
+            move.postToPid(pid)
+        }
+        prepare(mouse)
+        mouse.postToPid(pid)
+    }
+
+    /// Maps a point normalized to the captured frame (top-left origin) to window-relative points.
+    /// ScreenCaptureKit scales the window into the frame and may leave empty space around it,
+    /// so the frame's own content rect and scale are used rather than the window's bounds.
+    private func windowLocal(_ point: CGPoint) -> CGPoint {
+        guard let g = frameGeometry, g.contentScale > 0 else {
+            return CGPoint(x: point.x * sourceBounds.width, y: point.y * sourceBounds.height)
+        }
+        let x = (point.x * g.surfaceSize.width - g.contentRect.minX) / g.contentScale
+        let y = (point.y * g.surfaceSize.height - g.contentRect.minY) / g.contentScale
+        return CGPoint(x: x, y: y)
     }
 
     private static let windowNumberField = CGEventField(rawValue: 51)!
@@ -248,9 +300,28 @@ final class PiPController: NSObject {
     }
 }
 
+/// Content placement within a captured frame, all in frame points (top-left origin).
+struct FrameGeometry {
+    let surfaceSize: CGSize
+    let contentRect: CGRect
+    let contentScale: CGFloat
+
+    init?(info: [SCStreamFrameInfo: Any], surface: IOSurfaceRef) {
+        guard let rectDict = info[.contentRect],
+              let rect = CGRect(dictionaryRepresentation: rectDict as! CFDictionary),
+              let scale = info[.contentScale] as? CGFloat,
+              let factor = info[.scaleFactor] as? CGFloat, factor > 0
+        else { return nil }
+        surfaceSize = CGSize(width: CGFloat(IOSurfaceGetWidth(surface)) / factor,
+                             height: CGFloat(IOSurfaceGetHeight(surface)) / factor)
+        contentRect = rect
+        contentScale = scale
+    }
+}
+
 /// Receives frames on the capture queue and hands complete ones to the main thread.
 private final class FrameOutput: NSObject, SCStreamOutput, SCStreamDelegate {
-    var onFrame: ((IOSurfaceRef) -> Void)?
+    var onFrame: ((IOSurfaceRef, FrameGeometry?) -> Void)?
     var onStop: (() -> Void)?
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -263,7 +334,8 @@ private final class FrameOutput: NSObject, SCStreamOutput, SCStreamDelegate {
               let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue()
         else { return }
 
-        DispatchQueue.main.async { [weak self] in self?.onFrame?(surface) }
+        let geometry = attachments.first.flatMap { FrameGeometry(info: $0, surface: surface) }
+        DispatchQueue.main.async { [weak self] in self?.onFrame?(surface, geometry) }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

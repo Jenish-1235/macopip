@@ -1,7 +1,7 @@
 # MacoPiP
 
 Picture-in-picture for any macOS window, floating over full-screen apps.
-It shows a live, view-only mirror of the window you pin, made with ScreenCaptureKit. Your full-screen app keeps focus the whole time, and you can scroll the pinned window from the PiP.
+It shows a live mirror of the window you pin, made with ScreenCaptureKit. Your full-screen app keeps focus the whole time, and you can click and scroll the pinned window from the PiP.
 
 ## Install
 
@@ -18,7 +18,7 @@ cd macopip
 MacoPiP runs in the menu bar. It needs two permissions, each granted once in System Settings → Privacy & Security:
 
 - **Screen & System Audio Recording**, to mirror windows. Grant it on first launch, then quit and reopen MacoPiP.
-- **Accessibility**, to scroll the pinned window. MacoPiP asks for it the first time you scroll over a PiP.
+- **Accessibility**, to click and scroll the pinned window. MacoPiP asks for it the first time you click or scroll over a PiP.
 
 If you have an Apple Development certificate, `build.sh` signs with it, and macOS keeps both permissions across rebuilds. Without one, the app is signed ad hoc, and you may need to grant the permissions again after each rebuild.
 
@@ -33,9 +33,9 @@ If you have an Apple Development certificate, `build.sh` signs with it, and macO
 
 In the PiP window:
 
-- Scroll up and down to scroll the real window.
-- Drag the middle to move the PiP, and drag an edge to resize it. The aspect ratio stays the same.
-- Double-click to jump to the real app.
+- Click, right-click, drag and scroll to operate the real window.
+- Drag the control bar at the top (or hold ⌥ and drag anywhere) to move the PiP, and drag an edge to resize it. The aspect ratio stays the same.
+- Use the jump button in the control bar to switch to the real app.
 - Hover to see the close, opacity and jump buttons.
 
 The PiP hides itself while its source app is in front and comes back when you switch away.
@@ -46,6 +46,6 @@ Chrome, Brave, Edge, Arc, Vivaldi and Opera pause windows that are hidden behind
 
 ## Limitations
 
-- The PiP is view-only, apart from vertical scrolling. Clicks and typing aren't forwarded.
+- Clicks, drags and vertical scrolling are forwarded; typing isn't. Some apps, Chromium browsers in particular, ignore a few clicks while their window is in the background.
 - Minimized windows can't be mirrored.
-- Scroll forwarding uses a private CoreGraphics function (`CGEventSetWindowLocation`), so a future macOS update could break it.
+- Click and scroll forwarding use a private CoreGraphics function (`CGEventSetWindowLocation`), so a future macOS update could break it.
