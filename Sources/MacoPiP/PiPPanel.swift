@@ -16,6 +16,7 @@ final class PiPPanel: NSPanel {
         backgroundColor = .clear
         isOpaque = false
         hasShadow = true
+        acceptsMouseMovedEvents = true
         animationBehavior = .utilityWindow
     }
 
@@ -28,8 +29,9 @@ final class FirstMouseButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-/// Shows the mirrored frames, plus hover controls. Drag the middle to move,
-/// drag near an edge to resize (aspect ratio is kept), double-click to jump to the app.
+/// Shows the mirrored frames, plus hover controls. Clicks, drags and scrolls over the mirror
+/// are forwarded to the real window. Drag the control bar (or hold ⌥ and drag anywhere) to move,
+/// drag near an edge to resize (aspect ratio is kept).
 final class PiPView: NSView {
     var aspectRatio: CGFloat = 16.0 / 10.0
     var onClose: (() -> Void)?
@@ -38,14 +40,18 @@ final class PiPView: NSView {
     var onFrameCommitted: (() -> Void)?
     /// Scroll over the mirror; the point is normalized to 0...1 from the top-left corner.
     var onScroll: ((NSEvent, CGPoint) -> Void)?
+    /// Mouse button events over the mirror, same normalized point as `onScroll`.
+    var onMouse: ((NSEvent, CGPoint) -> Void)?
 
     private let videoLayer = CALayer()
     private let controls = NSVisualEffectView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let waitingLabel = NSTextField(labelWithString: "Waiting for window content…")
+    /// Aspect ratio of the latest captured frame; the mirror is letterboxed to this.
+    private var contentAspect: CGFloat?
     private var trackingArea: NSTrackingArea?
 
-    private enum DragMode { case none, resize(left: Bool, bottom: Bool, horizontal: Bool) }
+    private enum DragMode { case none, forward(right: Bool), resize(left: Bool, bottom: Bool, horizontal: Bool) }
     private var dragMode = DragMode.none
     private var startFrame = NSRect.zero
     private var startMouse = NSPoint.zero
@@ -99,7 +105,7 @@ final class PiPView: NSView {
             titleLabel,
             makeButton("sun.min", "Less opaque", #selector(fadeTapped)),
             makeButton("sun.max", "More opaque", #selector(unfadeTapped)),
-            makeButton("arrow.up.forward.app", "Go to app (or double-click)", #selector(jumpTapped)),
+            makeButton("arrow.up.forward.app", "Go to app", #selector(jumpTapped)),
         ])
         stack.spacing = 8
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
@@ -142,6 +148,8 @@ final class PiPView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         videoLayer.contents = surface
+        let w = IOSurfaceGetWidth(surface), h = IOSurfaceGetHeight(surface)
+        if w > 0, h > 0 { contentAspect = CGFloat(w) / CGFloat(h) }
         CATransaction.commit()
         if !waitingLabel.isHidden { waitingLabel.isHidden = true }
     }
@@ -159,7 +167,7 @@ final class PiPView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                                   owner: self, userInfo: nil)
         addTrackingArea(area)
         trackingArea = area
@@ -178,9 +186,33 @@ final class PiPView: NSView {
     // MARK: Scroll
 
     override func scrollWheel(with event: NSEvent) {
-        guard bounds.width > 0, bounds.height > 0 else { return }
+        guard let point = normalizedPoint(of: event) else { return }
+        onScroll?(event, point)
+    }
+
+    /// Where the frame is actually drawn inside the view (it is aspect-fitted).
+    private var contentRect: CGRect {
+        guard let aspect = contentAspect, bounds.width > 0, bounds.height > 0 else { return bounds }
+        if bounds.width / bounds.height > aspect {
+            let w = bounds.height * aspect
+            return CGRect(x: (bounds.width - w) / 2, y: 0, width: w, height: bounds.height)
+        }
+        let h = bounds.width / aspect
+        return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
+    }
+
+    private func normalizedPoint(of event: NSEvent) -> CGPoint? {
+        let rect = contentRect
+        guard rect.width > 0, rect.height > 0 else { return nil }
         let p = convert(event.locationInWindow, from: nil)
-        onScroll?(event, CGPoint(x: p.x / bounds.width, y: 1 - p.y / bounds.height))
+        let x = min(max((p.x - rect.minX) / rect.width, 0), 1)
+        let y = min(max((p.y - rect.minY) / rect.height, 0), 1)
+        return CGPoint(x: x, y: 1 - y)
+    }
+
+    private func forward(_ event: NSEvent) {
+        guard let point = normalizedPoint(of: event) else { return }
+        onMouse?(event, point)
     }
 
     // MARK: Move / resize
@@ -197,16 +229,33 @@ final class PiPView: NSView {
             dragMode = .resize(left: nearLeft, bottom: nearBottom, horizontal: nearLeft || nearRight)
             startFrame = window.frame
             startMouse = NSEvent.mouseLocation
-        } else if event.clickCount == 2 {
-            onJump?()
-        } else {
+        } else if controls.frame.contains(p) || event.modifierFlags.contains(.option) {
             dragMode = .none
             window.performDrag(with: event)
             onFrameCommitted?()
+        } else {
+            dragMode = .forward(right: false)
+            forward(event)
         }
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        dragMode = .forward(right: true)
+        forward(event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        if !controls.frame.contains(convert(event.locationInWindow, from: nil)) { forward(event) }
+    }
+
+    override func rightMouseDragged(with event: NSEvent) { forward(event) }
+    override func rightMouseUp(with event: NSEvent) {
+        forward(event)
+        dragMode = .none
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        if case .forward = dragMode { forward(event); return }
         guard case let .resize(left, bottom, horizontal) = dragMode, let window else { return }
         let mouse = NSEvent.mouseLocation
         let dx = mouse.x - startMouse.x, dy = mouse.y - startMouse.y
@@ -227,6 +276,7 @@ final class PiPView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if case .forward = dragMode { forward(event) }
         if case .resize = dragMode { onFrameCommitted?() }
         dragMode = .none
     }
